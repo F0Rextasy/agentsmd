@@ -1,0 +1,60 @@
+{
+  "budget": {
+    "detected": [
+      "over-budget"
+    ],
+    "exit": 1,
+    "expected": "over-budget",
+    "median_ms": 62.0,
+    "root": "budget",
+    "verdict": "ok"
+  },
+  "clean": {
+    "detected": [],
+    "exit": 0,
+    "expected": "ok",
+    "median_ms": 59.3,
+    "root": "clean",
+    "verdict": "ok"
+  },
+  "dup": {
+    "detected": [
+      "duplicated-section"
+    ],
+    "exit": 1,
+    "expected": "duplicated-section",
+    "median_ms": 58.7,
+    "root": "dup",
+    "verdict": "ok"
+  },
+  "fence": {
+    "detected": [
+      "unclosed-fence"
+    ],
+    "exit": 1,
+    "expected": "unclosed-fence",
+    "median_ms": 57.9,
+    "root": "fence",
+    "verdict": "ok"
+  },
+  "nopath": {
+    "detected": [
+      "missing-path"
+    ],
+    "exit": 1,
+    "expected": "missing-path",
+    "median_ms": 56.3,
+    "root": "nopath",
+    "verdict": "ok"
+  },
+  "notitle": {
+    "detected": [
+      "no-title"
+    ],
+    "exit": 1,
+    "expected": "no-title",
+    "median_ms": 60.3,
+    "root": "notitle",
+    "verdict": "ok"
+  }
+}

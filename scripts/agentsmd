@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""agentsmd - compile and lint AGENTS.md agent-instruction hierarchies.
+
+Subcommands:
+  lint       rule-check every AGENTS.md in a tree: title, fences, byte
+             budget, referenced paths, sections duplicated from the parent file
+  effective  compile the instruction chain for one path: sections merged
+             along the directory chain, child file wins, provenance per section
+  discover   list AGENTS.md files in dependency order
+
+Exit codes: 0 clean, 1 findings, 2 usage error. Python stdlib only.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+DEFAULT_MAX_BYTES = 24000
+
+SKIP_DIRS = {
+    ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+    "dist", "build", ".tox", "target", "vendor",
+}
+H1_RE = re.compile(r"^# \S", re.M)
+SECTION_RE = re.compile(r"^(#{2,6}) +(.+?) *$")
+SPAN_RE = re.compile(r"`([^`\n]+)`")
+SPAN_OK_RE = re.compile(r"[A-Za-z0-9_./+-]+")
+PATH_ENDINGS = (
+    "/", ".py", ".md", ".ts", ".tsx", ".js", ".jsx", ".json", ".yml",
+    ".yaml", ".toml", ".sh", ".rs", ".go", ".txt", ".cfg", ".ini",
+    ".sql", ".html", ".css",
+)
+
+
+def rel(path, root):
+    return os.path.relpath(path, root).replace(os.sep, "/")
+
+
+def read(path):
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        return handle.read()
+
+
+def discover(root):
+    """AGENTS.md files under root, vendored/hidden dirs skipped, sorted."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(
+            d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")
+        )
+        if "AGENTS.md" in filenames:
+            found.append(os.path.join(dirpath, "AGENTS.md"))
+    return sorted(found)
+
+
+def section_marks(text):
+    """(offset, level, title, line) per heading outside ``` fences."""
+    marks = []
+    in_fence = False
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        if line.lstrip().startswith("```"):
+            in_fence = not in_fence
+        elif not in_fence:
+            match = SECTION_RE.match(line)
+            if match:
+                marks.append((offset, len(match.group(1)),
+                              match.group(2).strip(),
+                              text.count("\n", 0, offset) + 1))
+        offset += len(line)
+    return marks
+
+
+def parse_sections(text):
+    """Level/title/line/body per heading; headings inside ``` fences ignored."""
+    marks = section_marks(text)
+    sections = []
+    for index, (start, level, title, line) in enumerate(marks):
+        end = marks[index + 1][0] if index + 1 < len(marks) else len(text)
+        sections.append({"level": level, "title": title, "line": line,
+                         "body": text[start:end]})
+    return sections
+
+
+def first_head(text):
+    """Text before the first fence-aware heading (the file preamble)."""
+    marks = section_marks(text)
+    end = marks[0][0] if marks else len(text)
+    return text[:end].strip()
+
+
+def path_spans(text):
+    """Backticked spans that look like repo-relative paths (no spaces/globs)."""
+    spans = []
+    for match in SPAN_RE.finditer(text):
+        span = match.group(1)
+        if " " in span or span.startswith(("http://", "https://", "$", "-", "/", "~")):
+            continue
+        if not SPAN_OK_RE.fullmatch(span):
+            continue
+        if not span.endswith(PATH_ENDINGS):
+            continue
+        spans.append((text.count("\n", 0, match.start()) + 1, span))
+    return spans
+
+
+def lint_text(text, root, max_bytes):
+    findings = []
+    if not H1_RE.search(text):
+        findings.append(("no-title", 1, "error", "no level-1 heading (`# ...`)"))
+    fence_lines = [text.count("\n", 0, m.start()) + 1
+                   for m in re.finditer(r"^```", text, re.M)]
+    if len(fence_lines) % 2:
+        findings.append(("unclosed-fence", fence_lines[-1], "error",
+                         "``` fence never closed"))
+    size = len(text.encode("utf-8"))
+    if size > max_bytes:
+        findings.append(("over-budget", 1, "warn",
+                         "%d bytes exceeds --max-bytes %d" % (size, max_bytes)))
+    for line, span in path_spans(text):
+        if not os.path.exists(os.path.join(root, span)):
+            findings.append(("missing-path", line, "error",
+                             "`%s` does not exist under root" % span))
+    return findings
+
+
+def normalized(body):
+    return " ".join(body.split())
+
+
+def parent_file(path, files):
+    """Nearest ancestor AGENTS.md in the same tree, or None."""
+    best = None
+    here = os.path.dirname(path)
+    for candidate in files:
+        if candidate == path:
+            continue
+        candidate_dir = os.path.dirname(candidate)
+        if here == candidate_dir or here.startswith(candidate_dir + os.sep):
+            if best is None or len(candidate_dir) > len(os.path.dirname(best)):
+                best = candidate
+    return best
+
+
+def lint_tree(root, max_bytes):
+    files = discover(root)
+    rows = []
+    for path in files:
+        text = read(path)
+        findings = lint_text(text, root, max_bytes)
+        parent = parent_file(path, files)
+        if parent:
+            child = {s["title"]: s for s in parse_sections(text) if s["level"] == 2}
+            above = {s["title"]: s for s in parse_sections(read(parent))
+                     if s["level"] == 2}
+            for title, section in child.items():
+                other = above.get(title)
+                if other and normalized(section["body"]) == normalized(other["body"]):
+                    findings.append((
+                        "duplicated-section", section["line"], "warn",
+                        "identical to %s:%d" % (rel(parent, root), other["line"]),
+                    ))
+        rows.append((path, findings))
+    return files, rows
+
+
+def chain_for(target, root):
+    """AGENTS.md files from root down to target's directory, root first."""
+    root_abs = os.path.abspath(root)
+    target_abs = os.path.abspath(target)
+    if os.path.isfile(target_abs):
+        target_abs = os.path.dirname(target_abs)
+    dirs = []
+    current = target_abs
+    while True:
+        dirs.append(current)
+        if current == root_abs:
+            break
+        up = os.path.dirname(current)
+        if up == current:
+            raise ValueError("path is outside --root")
+        current = up
+    dirs.reverse()
+    chain = []
+    for directory in dirs:
+        candidate = os.path.join(directory, "AGENTS.md")
+        if os.path.isfile(candidate):
+            chain.append(candidate)
+    if not chain:
+        raise ValueError("no AGENTS.md between root and target")
+    return chain
+
+
+def effective_doc(target, root):
+    """Merged sections along the chain: child wins, first-seen order kept."""
+    chain = chain_for(target, root)
+    root_abs = os.path.abspath(root)
+    merged = {}
+    order = []
+    preambles = []
+    for path in chain:
+        text = read(path)
+        head = first_head(text)
+        if head:
+            preambles.append({"source": rel(path, root_abs), "text": head})
+        for section in parse_sections(text):
+            key = (section["level"], section["title"])
+            if key not in merged:
+                order.append(key)
+            merged[key] = (section, rel(path, root_abs))
+    sections = [
+        {"level": merged[key][0]["level"], "title": merged[key][0]["title"],
+         "line": merged[key][0]["line"], "source": merged[key][1],
+         "body": merged[key][0]["body"]}
+        for key in order
+    ]
+    return {
+        "target": rel(os.path.abspath(target), root_abs),
+        "sources": [rel(path, root_abs) for path in chain],
+        "preambles": preambles,
+        "sections": sections,
+    }
+
+
+def render_effective(doc):
+    lines = ["<!-- compiled by agentsmd; sources: %s -->"
+             % " > ".join(doc["sources"])]
+    for preamble in doc["preambles"]:
+        lines.append("")
+        lines.append("<!-- preamble from %s -->" % preamble["source"])
+        lines.append(preamble["text"])
+    for section in doc["sections"]:
+        lines.append("")
+        lines.append("<!-- from %s:%d -->" % (section["source"], section["line"]))
+        lines.append(section["body"].rstrip("\n"))
+    return "\n".join(lines) + "\n"
+
+
+def cmd_lint(args):
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        print("agentsmd: no such directory: %s" % args.root, file=sys.stderr)
+        return 2
+    files, rows = lint_tree(root, args.max_bytes)
+    findings = []
+    for path, file_findings in rows:
+        for rule, line, severity, message in file_findings:
+            findings.append({"file": rel(path, root), "line": line, "rule": rule,
+                             "severity": severity, "message": message})
+    findings.sort(key=lambda f: (f["file"], f["line"], f["rule"]))
+    code = 1 if findings else 0
+    if args.format == "json":
+        print(json.dumps({
+            "command": " ".join(sys.argv),
+            "root": args.root,
+            "files": len(files),
+            "findings": findings,
+            "findings_total": len(findings),
+            "exit": code,
+        }, indent=2))
+    else:
+        for finding in findings:
+            print("%s:%d: %s: %s" % (finding["file"], finding["line"],
+                                     finding["rule"], finding["message"]))
+        print("lint: %d file(s), %d finding(s)" % (len(files), len(findings)))
+    return code
+
+
+def cmd_effective(args):
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        print("agentsmd: no such directory: %s" % args.root, file=sys.stderr)
+        return 2
+    try:
+        doc = effective_doc(args.path, root)
+    except ValueError as error:
+        print("agentsmd: %s" % error, file=sys.stderr)
+        return 2
+    if args.format == "json":
+        print(json.dumps({"command": " ".join(sys.argv), **doc}, indent=2))
+    else:
+        sys.stdout.write(render_effective(doc))
+    return 0
+
+
+def cmd_discover(args):
+    root = os.path.abspath(args.root)
+    if not os.path.isdir(root):
+        print("agentsmd: no such directory: %s" % args.root, file=sys.stderr)
+        return 2
+    files = [rel(path, root) for path in discover(root)]
+    if args.format == "json":
+        print(json.dumps({"command": " ".join(sys.argv), "root": args.root,
+                          "files": files, "count": len(files)}, indent=2))
+    else:
+        for name in files:
+            print(name)
+        print("discover: %d file(s)" % len(files))
+    return 0
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="agentsmd",
+        description="Compile and lint AGENTS.md agent-instruction hierarchies.",
+    )
+    sub = parser.add_subparsers(dest="cmd")
+
+    lint = sub.add_parser("lint", help="rule-check every AGENTS.md in a tree")
+    lint.add_argument("--root", default=".", help="tree to scan (default: .)")
+    lint.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_BYTES,
+                      help="per-file byte budget (default: %d)" % DEFAULT_MAX_BYTES)
+    lint.add_argument("--format", choices=("text", "json"), default="text")
+
+    effective = sub.add_parser("effective",
+                               help="compile the chain that applies to one path")
+    effective.add_argument("path", help="file or directory to compile for")
+    effective.add_argument("--root", default=".", help="chain root (default: .)")
+    effective.add_argument("--format", choices=("text", "json"), default="text")
+
+    discover_p = sub.add_parser("discover", help="list AGENTS.md files")
+    discover_p.add_argument("--root", default=".", help="tree to scan (default: .)")
+    discover_p.add_argument("--format", choices=("text", "json"), default="text")
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        parser.print_usage(sys.stderr)
+        return 2
+    if args.cmd == "lint":
+        return cmd_lint(args)
+    if args.cmd == "effective":
+        return cmd_effective(args)
+    return cmd_discover(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
